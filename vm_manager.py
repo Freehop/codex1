@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import secrets
 import sqlite3
 import subprocess
 import tarfile
@@ -162,8 +162,7 @@ class VMManager:
         if proc.returncode == 0:
             return []
 
-        issues = [line.strip() for line in (proc.stderr + "\n" + proc.stdout).splitlines() if line.strip()]
-        return issues
+        return [line.strip() for line in (proc.stderr + "\n" + proc.stdout).splitlines() if line.strip()]
 
     def ova_to_qcow2(self, ova_path: Path, output_qcow2: Path) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -174,9 +173,9 @@ class VMManager:
             candidates = list(tmp.glob("*.vmdk")) + list(tmp.glob("*.qcow2")) + list(tmp.glob("*.img"))
             if not candidates:
                 raise CommandError("No se encontró disco compatible dentro del archivo OVA")
-            disk_path = candidates[0]
+
             output_qcow2.parent.mkdir(parents=True, exist_ok=True)
-            self._run(["qemu-img", "convert", "-O", "qcow2", str(disk_path), str(output_qcow2)])
+            self._run(["qemu-img", "convert", "-O", "qcow2", str(candidates[0]), str(output_qcow2)])
 
         self.path_store.set("last_ova_input", str(ova_path.resolve()))
         self.path_store.set("last_qcow2_output", str(output_qcow2.resolve()))
@@ -202,8 +201,7 @@ class VMManager:
                 ]
             )
 
-            qemu_info = self._run(["qemu-img", "info", "--output=json", str(qcow2_path)]).stdout
-            info = json.loads(qemu_info)
+            info = json.loads(self._run(["qemu-img", "info", "--output=json", str(qcow2_path)]).stdout)
             capacity = int(info.get("virtual-size", 0))
             disk_id = str(uuid.uuid4())
 
@@ -238,6 +236,65 @@ class VMManager:
         self.path_store.set("last_qcow2_input", str(qcow2_path.resolve()))
         self.path_store.set("last_ova_output", str(output_ova.resolve()))
 
+    def add_network_compat(self, distro: str, mode: str, index: int, ip_cidr: str | None, gateway: str | None,
+                           dns: str | None, hosts_path: Path = Path("/etc/hosts"),
+                           netplan_dir: Path = Path("/etc/netplan")) -> Path:
+        interface_name = f"ens{index}"
+        legacy_name = f"enp0{index}"
+
+        if distro == "debian":
+            snippet = textwrap.dedent(
+                f"""
+                # vm_manager compat ({mode})
+                # Compatibilidad OVA/QCOW2: alias {legacy_name} -> {interface_name}
+                127.0.1.1 {legacy_name}
+                127.0.1.1 {interface_name}
+                """
+            ).strip() + "\n"
+            if hosts_path.exists() and snippet in hosts_path.read_text(encoding="utf-8", errors="ignore"):
+                return hosts_path
+            with hosts_path.open("a", encoding="utf-8") as fh:
+                fh.write("\n" + snippet)
+            self.path_store.set("last_hosts_update", str(hosts_path))
+            return hosts_path
+
+        random_name = f"99-vmcompat-{secrets.token_hex(3)}.yaml"
+        out = netplan_dir / random_name
+        netplan_dir.mkdir(parents=True, exist_ok=True)
+
+        dns_list = [x.strip() for x in (dns or "").split(",") if x.strip()]
+        nameservers_yaml = ""
+        if dns_list:
+            nameservers_yaml = f"\n      nameservers:\n        addresses: [{', '.join(dns_list)}]"
+
+        if mode == "dhcp":
+            interface_yaml = "dhcp4: true"
+        else:
+            if not ip_cidr or not gateway:
+                raise CommandError("Para modo static debes indicar --ip-cidr y --gateway")
+            interface_yaml = (
+                f"dhcp4: false\n      addresses: [{ip_cidr}]\n      routes:\n"
+                f"        - to: default\n          via: {gateway}{nameservers_yaml}"
+            )
+
+        content = textwrap.dedent(
+            f"""
+            network:
+              version: 2
+              renderer: networkd
+              ethernets:
+                {interface_name}:
+                  {interface_yaml}
+                {legacy_name}:
+                  dhcp4: true
+                  optional: true
+            """
+        ).strip() + "\n"
+
+        out.write_text(content, encoding="utf-8")
+        self.path_store.set("last_netplan_file", str(out))
+        return out
+
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Administrador de VMs con libvirt + convertidor OVA/QCOW2")
@@ -263,6 +320,14 @@ def make_parser() -> argparse.ArgumentParser:
     to_ova.add_argument("--qcow2", help="Ruta del archivo QCOW2")
     to_ova.add_argument("--out", help="Ruta de salida OVA")
     to_ova.add_argument("--name", required=True, help="Nombre lógico de VM para OVF")
+
+    compat = sub.add_parser("network-compat", help="Agrega compatibilidad ensX/enp0X para Debian/Ubuntu")
+    compat.add_argument("--distro", choices=["debian", "ubuntu"], required=True)
+    compat.add_argument("--mode", choices=["dhcp", "static"], required=True)
+    compat.add_argument("--index", type=int, default=3, help="Índice de interfaz, normalmente 3, 9, etc.")
+    compat.add_argument("--ip-cidr", help="IP/CIDR para static, ej 192.168.122.50/24")
+    compat.add_argument("--gateway", help="Gateway para static")
+    compat.add_argument("--dns", help="DNS separado por comas")
 
     sub.add_parser("paths", help="Muestra rutas guardadas para automatización")
     return parser
@@ -321,6 +386,17 @@ def main() -> int:
             output_ova = resolve_with_saved(args.out, "last_ova_output", store, "salida OVA")
             manager.qcow2_to_ova(qcow2_path, output_ova, args.name)
             print(f"Conversión completada: {qcow2_path} -> {output_ova}")
+
+        elif args.command == "network-compat":
+            changed = manager.add_network_compat(
+                distro=args.distro,
+                mode=args.mode,
+                index=args.index,
+                ip_cidr=args.ip_cidr,
+                gateway=args.gateway,
+                dns=args.dns,
+            )
+            print(f"Compatibilidad aplicada en: {changed}")
 
         elif args.command == "paths":
             data = store.all()
